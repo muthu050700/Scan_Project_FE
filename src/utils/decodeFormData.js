@@ -20,7 +20,7 @@ export async function sendImageToBackend(dataUri) {
 
     console.log("Sending file to backend...");
 
-    const response = await fetch("http://localhost:7777/ocr", {
+    const response = await fetch("https://scan-project-be-5.onrender.com/ocr", {
         method: "POST",
         body: formData,
     });
