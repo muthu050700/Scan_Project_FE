@@ -1,7 +1,7 @@
 import React, { useState, useCallback, useRef } from 'react'
 import Camera, { FACING_MODES } from "react-html5-camera-photo"
 import "react-html5-camera-photo/build/css/index.css"
-import { sendImageToBackend } from "../utils/decodeFormData"
+import { sendImageToBackend, sendMultipleFilesToBackend } from "../utils/decodeFormData"
 import { motion, AnimatePresence } from "framer-motion"
 import ExcelJS from 'exceljs'
 import { saveAs } from 'file-saver'
@@ -145,12 +145,15 @@ const CameraComponent = () => {
     const [facingMode, setFacingMode] = useState(FACING_MODES.ENVIRONMENT)
     const [ripple, setRipple] = useState(false)
     const [isCameraReady, setIsCameraReady] = useState(false)
-    const [previewImage, setPreviewImage] = useState(null)
-    const [previewType, setPreviewType] = useState("image") // image | pdf
+    const [selectedFiles, setSelectedFiles] = useState([]) // Array of { id, type: "image" | "pdf", dataUri, nativeFile (optional) }
+    const [fullScreenPreview, setFullScreenPreview] = useState(null) // null or { id, type, dataUri }
     const [scanResult, setScanResult] = useState(null)
+    const [scanProgress, setScanProgress] = useState(null) // { current: number, total: number }
     const [isFullScreen, setIsFullScreen] = useState(false)
-
     const fileInputRef = useRef(null)
+
+    const MAX_PDFS = 10;
+    const MAX_IMAGES = 10;
 
     const generateExcel = async (data) => {
         try {
@@ -160,8 +163,16 @@ const CameraComponent = () => {
             let items = [];
             if (data.invoices && Array.isArray(data.invoices)) {
                 items = data.invoices;
+            } else if (Array.isArray(data)) {
+                // Handle array of single objects that we might aggregate
+                items = data.map(item => {
+                    const { success, pages, rawText, ...rest } = item;
+                    // If it's already an invoice object, just return it, otherwise return rest
+                    return item.invoice ? item.invoice : rest;
+                });
+                // Flatten if there are arrays of invoices inside the array
+                items = items.flat().filter(item => item !== undefined && Object.keys(item).length > 0);
             } else if (typeof data === 'object' && !Array.isArray(data)) {
-                // If it's a single object, wrap it in an array
                 const { success, pages, rawText, ...rest } = data;
                 items = [rest];
             }
@@ -238,50 +249,103 @@ const CameraComponent = () => {
         }
     }
 
+    const processFiles = useCallback(async (filesToProcess) => {
+        if (!filesToProcess || filesToProcess.length === 0) return;
 
-    const processImage = useCallback(async (dataUri) => {
-        setStatus("scanning")
+        setStatus("scanning");
+        setScanProgress({ current: 0, total: filesToProcess.length });
+
         try {
-            const result = await sendImageToBackend(dataUri)
-            if (result && result.success) {
-                setStatus("success")
-                setScanResult(result)
-                // Removed automatic download
+            // ✅ Send all files in one batch request instead of looping
+            const inputs = filesToProcess.map((fileObj) => fileObj.dataUri);
+            const result = await sendMultipleFilesToBackend(inputs);
+
+            setScanProgress({ current: filesToProcess.length, total: filesToProcess.length });
+
+            if (result.success && result.invoices?.length > 0) {
+                setStatus("success");
+                setScanResult({ invoices: result.invoices });
+            } else if (result.summary?.failedCount > 0) {
+                console.error("Some files failed:", result.files.filter(f => !f.success));
+                setStatus("success"); // still show partial results
+                setScanResult({ invoices: result.invoices ?? [] });
             } else {
-                throw new Error("Scan failed")
+                setStatus("success");
+                setScanResult({ invoices: [] });
             }
         } catch (error) {
-            console.error("Processing error:", error)
-            setStatus("error")
-            setTimeout(() => setStatus("idle"), 3500)
+            console.error("Batch processing error:", error);
+            setStatus("error");
+            setTimeout(() => setStatus("idle"), 3500);
+        } finally {
+            setScanProgress(null);
         }
-    }, [])
+    }, []);
 
     const handleTakePhoto = useCallback((dataUri) => {
         setRipple(true)
         setTimeout(() => setRipple(false), 600)
-        setPreviewType("image")
-        setPreviewImage(dataUri)
-    }, [])
 
-    const handleFileUpload = useCallback((e) => {
-        const file = e.target.files?.[0]
-        if (file) {
-            const isPdf = file.type === "application/pdf"
-            setPreviewType(isPdf ? "pdf" : "image")
-
-            const reader = new FileReader()
-            reader.onload = (event) => {
-                const dataUri = event.target?.result
-                if (typeof dataUri === 'string') {
-                    setPreviewImage(dataUri)
-                }
+        setSelectedFiles(prev => {
+            const currentImages = prev.filter(f => f.type === "image");
+            if (currentImages.length >= MAX_IMAGES) {
+                alert(`You can only upload up to ${MAX_IMAGES} images.`);
+                return prev;
             }
-            reader.readAsDataURL(file)
-            // Fix: Reset the input value so the same file can be uploaded again
-            e.target.value = ""
-        }
+            return [...prev, {
+                id: Math.random().toString(36).substring(7),
+                type: "image",
+                dataUri
+            }]
+        })
     }, [])
+
+    const handleFileUpload = useCallback(async (e) => {
+        const files = Array.from(e.target.files || []);
+        if (files.length === 0) return;
+
+        let newSelectedFiles = [...selectedFiles];
+
+        for (const file of files) {
+            const isPdf = file.type === "application/pdf";
+            const type = isPdf ? "pdf" : "image";
+
+            const currentCount = newSelectedFiles.filter(f => f.type === type).length;
+            const maxAllowed = isPdf ? MAX_PDFS : MAX_IMAGES;
+
+            if (currentCount >= maxAllowed) {
+                alert(`You can only upload up to ${maxAllowed} ${type}s.`);
+                continue; // Skip adding this file since limit is reached
+            }
+
+            try {
+                const dataUri = await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = (event) => resolve(event.target.result);
+                    reader.onerror = (error) => reject(error);
+                    reader.readAsDataURL(file);
+                });
+
+                if (typeof dataUri === 'string') {
+                    newSelectedFiles.push({
+                        id: Math.random().toString(36).substring(7),
+                        type,
+                        dataUri,
+                        nativeFile: file
+                    });
+                }
+            } catch (err) {
+                console.error("Error reading file:", err);
+            }
+        }
+
+        setSelectedFiles(newSelectedFiles);
+        e.target.value = ""; // Reset input so same file can be uploaded again
+    }, [selectedFiles])
+
+    const removeFile = useCallback((idToRemove) => {
+        setSelectedFiles(prev => prev.filter(f => f.id !== idToRemove));
+    }, []);
 
     const handleCameraStart = useCallback(() => {
         setIsCameraReady(true)
@@ -294,24 +358,24 @@ const CameraComponent = () => {
     }, [])
 
     const handleConfirmScan = () => {
-        if (status === "success") {
+        if (status === "success" || status === "error") {
             // Reset everything to start a new scan
             setStatus("idle")
-            setPreviewImage(null)
+            setSelectedFiles([])
             setScanResult(null)
-            setIsFullScreen(false)
+            setFullScreenPreview(null)
             return
         }
-        
-        if (previewImage) {
-            processImage(previewImage)
+
+        if (selectedFiles.length > 0) {
+            processFiles(selectedFiles)
         }
     }
 
     const handleCancelPreview = () => {
-        setPreviewImage(null)
+        setSelectedFiles([])
         setScanResult(null)
-        setIsFullScreen(false)
+        setFullScreenPreview(null)
     }
 
     const toggleCamera = () => {
@@ -336,6 +400,15 @@ const CameraComponent = () => {
                 background: "linear-gradient(160deg, #0f0a1e 0%, #1a0b35 40%, #0d1526 100%)",
             }}
         >
+            <input
+                type="file"
+                ref={fileInputRef}
+                onChange={handleFileUpload}
+                accept="image/*,application/pdf"
+                className="hidden"
+                multiple
+            />
+
             {/* ── Background decorative orbs ─────────────────────────────────── */}
             <div
                 className="absolute top-[-120px] right-[-80px] w-72 h-72 rounded-full pointer-events-none"
@@ -442,12 +515,12 @@ const CameraComponent = () => {
                         boxShadow: "0 0 40px rgba(124,58,237,0.2), inset 0 0 30px rgba(0,0,0,0.4)",
                     }}
                 >
-                    {previewImage ? (
+                    {selectedFiles.length > 0 && !isCameraActive ? (
                         <motion.div
                             initial={{ opacity: 0 }}
                             animate={{ opacity: 1 }}
                             exit={{ opacity: 0 }}
-                            className="absolute inset-0 z-30 flex flex-col items-center justify-center p-4 backdrop-blur-xl bg-[#0f0a1e]/80 overflow-hidden"
+                            className="absolute inset-0 z-30 flex flex-col p-4 backdrop-blur-xl bg-[#0f0a1e]/80 overflow-hidden"
                         >
                             {/* Backdrop decorative glow */}
                             <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[120%] h-[120%] opacity-20 pointer-events-none"
@@ -457,68 +530,69 @@ const CameraComponent = () => {
                                 }}
                             />
 
-                            <motion.div
-                                initial={{ scale: 0.9, y: 20, opacity: 0 }}
-                                animate={{ scale: 1, y: 0, opacity: 1 }}
-                                transition={{ type: "spring", stiffness: 260, damping: 20 }}
-                                className="relative w-full h-[65%] flex items-center justify-center rounded-3xl overflow-hidden shadow-2xl border border-white/10 group bg-black/20"
-                            >
-                                {previewType === "pdf" ? (
-                                    <div
-                                        className="flex flex-col items-center gap-4 text-purple-300 cursor-pointer"
-                                        onClick={() => setIsFullScreen(true)}
-                                    >
-                                        <div className="p-6 rounded-3xl bg-purple-500/10 border border-purple-500/20 shadow-inner">
-                                            <PdfIcon />
-                                        </div>
-                                        <span className="text-xs font-bold tracking-widest uppercase opacity-60">PDF Document</span>
-                                    </div>
-                                ) : (
-                                    <img
-                                        src={previewImage}
-                                        alt="Preview"
-                                        className="w-full h-full object-contain transition-transform duration-700 group-hover:scale-105 cursor-pointer"
-                                        onClick={() => setIsFullScreen(true)}
-                                    />
-                                )}
+                            <div className="relative w-full h-full overflow-y-auto pr-2 custom-scrollbar" style={{ paddingBottom: '20px' }}>
+                                <div className="grid grid-cols-2 gap-4 auto-rows-max">
+                                    <AnimatePresence>
+                                        {selectedFiles.map((file, idx) => (
+                                            <motion.div
+                                                key={file.id}
+                                                initial={{ scale: 0.9, y: 20, opacity: 0 }}
+                                                animate={{ scale: 1, y: 0, opacity: 1 }}
+                                                exit={{ scale: 0.8, opacity: 0 }}
+                                                transition={{ type: "spring", stiffness: 260, damping: 20, delay: idx * 0.05 }}
+                                                className="relative w-full aspect-[3/4] flex items-center justify-center rounded-2xl overflow-hidden shadow-lg border border-white/10 group bg-black/40"
+                                            >
+                                                {file.type === "pdf" ? (
+                                                    <div
+                                                        className="flex flex-col items-center justify-center w-full h-full gap-2 text-purple-300 cursor-pointer"
+                                                        onClick={() => {
+                                                            setFullScreenPreview(file);
+                                                            setIsFullScreen(true);
+                                                        }}
+                                                    >
+                                                        <div className="p-4 rounded-2xl bg-purple-500/10 border border-purple-500/20 shadow-inner">
+                                                            <PdfIcon />
+                                                        </div>
+                                                        <span className="text-[9px] font-bold tracking-widest uppercase opacity-60 text-center px-2 truncate w-full">
+                                                            {file.nativeFile?.name || `PDF Document ${idx + 1}`}
+                                                        </span>
+                                                    </div>
+                                                ) : (
+                                                    <img
+                                                        src={file.dataUri}
+                                                        alt="Preview"
+                                                        className="w-full h-full object-cover transition-transform duration-700 group-hover:scale-105 cursor-pointer"
+                                                        onClick={() => {
+                                                            setFullScreenPreview(file);
+                                                            setIsFullScreen(true);
+                                                        }}
+                                                    />
+                                                )}
 
-                                {/* Interactive hint */}
-                                <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
-                                    <div className="px-3 py-1.5 rounded-full glass text-[10px] font-bold text-white uppercase tracking-widest border border-white/20">
-                                        Tap to expand
-                                    </div>
+                                                {/* Interactive hint */}
+                                                <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none bg-black/20">
+                                                    <div className="px-3 py-1.5 rounded-full glass text-[8px] font-bold text-white uppercase tracking-widest border border-white/20">
+                                                        Tap to expand
+                                                    </div>
+                                                </div>
+
+                                                <div className="absolute top-2 right-2">
+                                                    <motion.button
+                                                        whileHover={{ scale: 1.1, rotate: 90 }}
+                                                        whileTap={{ scale: 0.9 }}
+                                                        onClick={(e) => { e.stopPropagation(); removeFile(file.id); }}
+                                                        className="w-7 h-7 rounded-full glass text-white flex items-center justify-center border border-white/20 shadow-lg bg-black/50 hover:bg-red-500/50"
+                                                    >
+                                                        <svg viewBox="0 0 24 24" fill="none" className="w-4 h-4" stroke="currentColor" strokeWidth={2}>
+                                                            <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                                                        </svg>
+                                                    </motion.button>
+                                                </div>
+                                            </motion.div>
+                                        ))}
+                                    </AnimatePresence>
                                 </div>
-
-                                {/* Subtle scanning pulse overlay */}
-                                <motion.div
-                                    animate={{ opacity: [0.1, 0.3, 0.1] }}
-                                    transition={{ duration: 2, repeat: Infinity }}
-                                    className="absolute inset-0 pointer-events-none"
-                                    style={{
-                                        background: "linear-gradient(180deg, transparent 0%, rgba(124,58,237,0.1) 50%, transparent 100%)",
-                                    }}
-                                />
-
-                                <div className="absolute top-4 right-4">
-                                    <motion.button
-                                        whileHover={{ scale: 1.1, rotate: 90 }}
-                                        whileTap={{ scale: 0.9 }}
-                                        onClick={handleCancelPreview}
-                                        className="w-10 h-10 rounded-full glass text-white flex items-center justify-center border border-white/20 shadow-lg"
-                                    >
-                                        <CloseIcon />
-                                    </motion.button>
-                                </div>
-                            </motion.div>
-
-                            <motion.div
-                                initial={{ y: 20, opacity: 0 }}
-                                animate={{ y: 0, opacity: 1 }}
-                                transition={{ delay: 0.2 }}
-                                className="mt-4"
-                            >
-                                <p className="text-purple-400/60 text-[10px] font-bold tracking-[0.2em] uppercase">Document Preview</p>
-                            </motion.div>
+                            </div>
                         </motion.div>
                     ) : isCameraActive ? (
                         <>
@@ -589,7 +663,9 @@ const CameraComponent = () => {
                                     }}
                                 />
                                 <p className="text-white font-semibold text-base">Processing…</p>
-                                <p className="text-purple-300 text-xs mt-1">Analysing document</p>
+                                <p className="text-purple-300 text-xs mt-1">
+                                    {scanProgress ? `Analyzing document ${scanProgress.current} of ${scanProgress.total}` : "Analyzing document"}
+                                </p>
                             </motion.div>
                         )}
 
@@ -660,26 +736,38 @@ const CameraComponent = () => {
                 animate="visible"
                 className="px-5 pt-6 pb-10 flex flex-col items-center gap-6 z-20"
             >
-                {previewImage ? (
+                {selectedFiles.length > 0 && !isCameraActive ? (
                     <motion.div
                         initial={{ y: 40, opacity: 0 }}
                         animate={{ y: 0, opacity: 1 }}
                         className="flex flex-col items-center gap-4 w-full px-4"
                     >
-                        <div className="flex gap-2 w-full max-w-[280px]">
-                            <motion.button
-                                whileHover={{ scale: 1.02 }}
-                                whileTap={{ scale: 0.98 }}
-                                onClick={handleCancelPreview}
-                                className="flex-1 py-2 rounded-lg glass text-purple-200 text-[9px] font-bold border border-purple-500/20 tracking-wider uppercase"
-                            >
-                                Retake
-                            </motion.button>
+                        <div className="flex gap-2 w-full max-w-[320px]">
+                            {status !== "success" ? (
+                                <>
+                                    <motion.button
+                                        whileHover={{ scale: 1.02 }}
+                                        whileTap={{ scale: 0.98 }}
+                                        onClick={handleCancelPreview}
+                                        className="flex-1 py-2 rounded-lg glass text-purple-200 text-[9px] font-bold border border-purple-500/20 tracking-wider uppercase"
+                                    >
+                                        Clear All
+                                    </motion.button>
+                                    <motion.button
+                                        whileHover={{ scale: 1.02 }}
+                                        whileTap={{ scale: 0.98 }}
+                                        onClick={() => fileInputRef.current?.click()}
+                                        className="flex-[1.2] py-2 rounded-lg glass text-white text-[9px] font-bold border border-purple-500/40 tracking-wider uppercase bg-purple-500/20"
+                                    >
+                                        + Add File
+                                    </motion.button>
+                                </>
+                            ) : null}
                             <motion.button
                                 whileHover={{ scale: 1.02, boxShadow: "0 0 15px rgba(124,58,237,0.4)" }}
                                 whileTap={{ scale: 0.98 }}
                                 onClick={handleConfirmScan}
-                                className="flex-[1.2] py-2 rounded-lg text-white text-[9px] font-extrabold tracking-widest flex items-center justify-center gap-1.5 group relative overflow-hidden uppercase"
+                                className={`py-2 rounded-lg text-white text-[9px] font-extrabold tracking-widest flex items-center justify-center gap-1.5 group relative overflow-hidden uppercase ${status === "success" ? "w-full" : "flex-[1.5]"}`}
                                 style={{
                                     background: "linear-gradient(135deg, #7c3aed, #a855f7)",
                                 }}
@@ -690,7 +778,7 @@ const CameraComponent = () => {
                                     transition={{ duration: 2, repeat: Infinity, repeatDelay: 1 }}
                                     className="absolute top-0 bottom-0 w-16 bg-white/20 skew-x-[45deg] pointer-events-none"
                                 />
-                                {status === "success" ? "Done" : "Ready to Scan"} <CheckIcon />
+                                {status === "success" ? "Done" : `Process All (${selectedFiles.length})`} <CheckIcon />
                             </motion.button>
                         </div>
 
@@ -738,14 +826,6 @@ const CameraComponent = () => {
                             </motion.button>
                             <span className="text-purple-400 text-[10px] font-bold tracking-widest uppercase">File</span>
                         </div>
-
-                        <input
-                            type="file"
-                            ref={fileInputRef}
-                            onChange={handleFileUpload}
-                            accept="image/*,application/pdf"
-                            className="hidden"
-                        />
 
                         {/* Capture button (only visible when camera active) */}
                         <div className="relative flex items-center justify-center w-24 h-24">
@@ -854,15 +934,15 @@ const CameraComponent = () => {
                             </motion.button>
 
                             <div className="flex-1 w-full relative rounded-2xl overflow-hidden bg-black/40">
-                                {previewType === "pdf" ? (
+                                {fullScreenPreview?.type === "pdf" ? (
                                     <iframe
-                                        src={previewImage}
+                                        src={fullScreenPreview.dataUri}
                                         className="w-full h-full border-0"
                                         title="PDF Preview"
                                     />
                                 ) : (
                                     <img
-                                        src={previewImage}
+                                        src={fullScreenPreview?.dataUri}
                                         alt="Full View"
                                         className="w-full h-full object-contain"
                                     />
