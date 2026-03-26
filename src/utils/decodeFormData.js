@@ -1,4 +1,4 @@
-const BACKEND_URL = "http://localhost:3000";
+const BACKEND_URL = "https://scan-project-be-5.onrender.com";
 
 // ── Convert dataURI → Blob ──
 function dataURItoBlob(dataURI) {
